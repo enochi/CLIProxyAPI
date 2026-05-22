@@ -78,6 +78,12 @@ type Plugin interface {
 	HandleUsage(ctx context.Context, record Record)
 }
 
+// SyncPlugin optionally observes usage records synchronously before they enter
+// the asynchronous usage queue. Implementations must return quickly.
+type SyncPlugin interface {
+	HandleUsageSync(ctx context.Context, record Record)
+}
+
 type queueItem struct {
 	ctx    context.Context
 	record Record
@@ -152,6 +158,7 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 	if m == nil {
 		return
 	}
+	m.dispatchSync(ctx, record)
 	// ensure worker is running even if Start was not called explicitly
 	m.Start(context.Background())
 	m.mu.Lock()
@@ -162,6 +169,20 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
 	m.mu.Unlock()
 	m.cond.Signal()
+}
+
+func (m *Manager) dispatchSync(ctx context.Context, record Record) {
+	m.pluginsMu.RLock()
+	plugins := make([]Plugin, len(m.plugins))
+	copy(plugins, m.plugins)
+	m.pluginsMu.RUnlock()
+	for _, plugin := range plugins {
+		syncPlugin, ok := plugin.(SyncPlugin)
+		if !ok || syncPlugin == nil {
+			continue
+		}
+		safeInvokeSync(syncPlugin, ctx, record)
+	}
 }
 
 func (m *Manager) run(ctx context.Context) {
@@ -204,6 +225,15 @@ func safeInvoke(plugin Plugin, ctx context.Context, record Record) {
 		}
 	}()
 	plugin.HandleUsage(ctx, record)
+}
+
+func safeInvokeSync(plugin SyncPlugin, ctx context.Context, record Record) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("usage: sync plugin panic recovered: %v", r)
+		}
+	}()
+	plugin.HandleUsageSync(ctx, record)
 }
 
 var defaultManager = NewManager(512)

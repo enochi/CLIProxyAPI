@@ -23,6 +23,7 @@ const (
 	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 	DefaultAuthDir               = "~/.cli-proxy-api"
+	DefaultLiteLLMPriceSourceURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -97,6 +98,9 @@ type Config struct {
 
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
+
+	// CustomerKeyPolicy controls per-customer API key model access, quotas, and records.
+	CustomerKeyPolicy CustomerKeyPolicyConfig `yaml:"customer-key-policy" json:"customer-key-policy"`
 
 	// AntigravitySignatureCacheEnabled controls whether signature cache validation is enabled for thinking blocks.
 	// When true (default), cached signatures are preferred and validated.
@@ -204,6 +208,25 @@ type RemoteManagement struct {
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
+}
+
+// CustomerKeyPolicyConfig controls the isolated customer API key policy subsystem.
+type CustomerKeyPolicyConfig struct {
+	// Enabled turns on policy evaluation. Missing per-key policies still preserve current behavior.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// StorePath optionally overrides where policy state, counters, records, and prices are stored.
+	StorePath string `yaml:"store-path" json:"store-path"`
+	// MaxAccessRecords controls JSONL retention for access records. <= 0 uses the default.
+	MaxAccessRecords int `yaml:"max-access-records" json:"max-access-records"`
+	// PriceSync controls LiteLLM price cache synchronization.
+	PriceSync CustomerKeyPolicyPriceSyncConfig `yaml:"price-sync" json:"price-sync"`
+}
+
+// CustomerKeyPolicyPriceSyncConfig controls model price cache synchronization.
+type CustomerKeyPolicyPriceSyncConfig struct {
+	Enabled                  bool   `yaml:"enabled" json:"enabled"`
+	SourceURL                string `yaml:"source-url" json:"source-url"`
+	FailClosedOnMissingPrice bool   `yaml:"fail-closed-on-missing-price" json:"fail-closed-on-missing-price"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
@@ -631,6 +654,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	applyCustomerKeyPolicyDefaults(&cfg)
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
@@ -698,6 +722,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 
+	cfg.SanitizeCustomerKeyPolicy()
+
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 
@@ -754,6 +780,32 @@ func (cfg *Config) SanitizePayloadRules() {
 	}
 	cfg.Payload.DefaultRaw = sanitizePayloadRawRules(cfg.Payload.DefaultRaw, "default-raw")
 	cfg.Payload.OverrideRaw = sanitizePayloadRawRules(cfg.Payload.OverrideRaw, "override-raw")
+}
+
+func applyCustomerKeyPolicyDefaults(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	cfg.CustomerKeyPolicy.Enabled = true
+	cfg.CustomerKeyPolicy.MaxAccessRecords = 10000
+	cfg.CustomerKeyPolicy.PriceSync.Enabled = true
+	cfg.CustomerKeyPolicy.PriceSync.SourceURL = DefaultLiteLLMPriceSourceURL
+	cfg.CustomerKeyPolicy.PriceSync.FailClosedOnMissingPrice = true
+}
+
+// SanitizeCustomerKeyPolicy normalizes customer-key policy settings after parsing.
+func (cfg *Config) SanitizeCustomerKeyPolicy() {
+	if cfg == nil {
+		return
+	}
+	cfg.CustomerKeyPolicy.StorePath = strings.TrimSpace(cfg.CustomerKeyPolicy.StorePath)
+	if cfg.CustomerKeyPolicy.MaxAccessRecords <= 0 {
+		cfg.CustomerKeyPolicy.MaxAccessRecords = 10000
+	}
+	cfg.CustomerKeyPolicy.PriceSync.SourceURL = strings.TrimSpace(cfg.CustomerKeyPolicy.PriceSync.SourceURL)
+	if cfg.CustomerKeyPolicy.PriceSync.SourceURL == "" {
+		cfg.CustomerKeyPolicy.PriceSync.SourceURL = DefaultLiteLLMPriceSourceURL
+	}
 }
 
 func sanitizePayloadRawRules(rules []PayloadRule, section string) []PayloadRule {
@@ -1369,6 +1421,8 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 			return node.Value == DefaultPanelGitHubRepository
 		case "routing.strategy":
 			return node.Value == "round-robin"
+		case "customer-key-policy.price-sync.source-url":
+			return node.Value == DefaultLiteLLMPriceSourceURL
 		}
 	}
 
@@ -1377,6 +1431,18 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "error-logs-max-files":
 			return node.Value == "10"
+		case "customer-key-policy.max-access-records":
+			return node.Value == "10000"
+		}
+	}
+
+	// Check bool defaults
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
+		switch fullPath {
+		case "customer-key-policy.enabled",
+			"customer-key-policy.price-sync.enabled",
+			"customer-key-policy.price-sync.fail-closed-on-missing-price":
+			return node.Value == "true"
 		}
 	}
 

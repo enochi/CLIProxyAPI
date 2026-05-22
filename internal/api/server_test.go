@@ -85,6 +85,33 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
+func TestRootDoesNotExposeEndpointCatalog(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+	}
+	if body := rr.Body.String(); strings.Contains(body, "/v1/") || strings.Contains(body, "chat/completions") {
+		t.Fatalf("root response exposes API endpoints: %s", body)
+	}
+}
+
+func TestManagementControlPanelRequiresConfiguredManagementSecret(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+	}
+}
+
 func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 

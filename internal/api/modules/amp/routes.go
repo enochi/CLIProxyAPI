@@ -282,6 +282,9 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	if auth != nil {
 		ampProviders.Use(auth)
 	}
+	if len(m.providerMiddleware) > 0 {
+		ampProviders.Use(m.providerMiddleware...)
+	}
 	// Inject client API key into request context for per-client upstream routing
 	ampProviders.Use(clientAPIKeyMiddleware())
 

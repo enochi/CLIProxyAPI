@@ -195,3 +195,46 @@ func TestDeleteAuthFile_BatchQuery(t *testing.T) {
 		}
 	}
 }
+
+func TestDeleteAuthFile_SingleJSONBodyReturnsDeletedFile(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "single.json"
+	if err := os.WriteFile(filepath.Join(authDir, fileName), []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("failed to write auth file %s: %v", fileName, err)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	body := bytes.NewBufferString(`{"names":["single.json"]}`)
+	req := httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files", body)
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.DeleteAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if got, ok := payload["deleted"].(float64); !ok || int(got) != 1 {
+		t.Fatalf("expected deleted=1, got %#v", payload["deleted"])
+	}
+	files, ok := payload["files"].([]any)
+	if !ok || len(files) != 1 || files[0] != fileName {
+		t.Fatalf("expected files=[%q], got %#v", fileName, payload["files"])
+	}
+	if _, err := os.Stat(filepath.Join(authDir, fileName)); !os.IsNotExist(err) {
+		t.Fatalf("expected auth file %s to be removed, stat err: %v", fileName, err)
+	}
+}

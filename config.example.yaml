@@ -48,6 +48,17 @@ api-keys:
   - "your-api-key-2"
   - "your-api-key-3"
 
+# Per-customer API key model policy, hard quotas, access records, and LiteLLM price sync.
+# Mutable policies/counters/records/prices live in standalone files under store-path.
+customer-key-policy:
+  enabled: true
+  store-path: "" # default: .customer-key-policy next to config.yaml
+  max-access-records: 10000
+  price-sync:
+    enabled: true
+    source-url: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+    fail-closed-on-missing-price: true
+
 # Enable debug logging
 debug: false
 

@@ -30,6 +30,7 @@ import (
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v7/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/customerpolicy"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
@@ -173,6 +174,9 @@ type Server struct {
 	// management handler
 	mgmt *managementHandlers.Handler
 
+	// customerPolicy enforces per-customer API key policies and quota state.
+	customerPolicy *customerpolicy.Manager
+
 	// ampModule is the Amp routing module for model mapping hot-reload
 	ampModule *ampmodule.AmpModule
 
@@ -254,12 +258,25 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	envAdminPassword = strings.TrimSpace(envAdminPassword)
 	envManagementSecret := envAdminPasswordSet && envAdminPassword != ""
 
+	customerPolicyManager, errCustomerPolicy := customerpolicy.NewManager(customerpolicy.Options{
+		Config:         cfg.CustomerKeyPolicy,
+		ConfigFilePath: configFilePath,
+		APIKeys:        cfg.APIKeys,
+	})
+	if errCustomerPolicy != nil {
+		log.WithError(errCustomerPolicy).Warn("customer policy manager disabled")
+	}
+	if customerPolicyManager != nil {
+		customerpolicy.RegisterUsagePlugin(customerPolicyManager)
+	}
+
 	// Create server instance
 	s := &Server{
 		engine:              engine,
 		handlers:            handlers.NewBaseAPIHandlers(&cfg.SDKConfig, authManager),
 		cfg:                 cfg,
 		accessManager:       accessManager,
+		customerPolicy:      customerPolicyManager,
 		requestLogger:       requestLogger,
 		loggerToggle:        toggle,
 		configFilePath:      configFilePath,
@@ -279,6 +296,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.mgmt.SetCustomerPolicyManager(s.customerPolicy)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -297,7 +315,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.setupRoutes()
 
 	// Register Amp module using V2 interface with Context
-	s.ampModule = ampmodule.NewLegacy(accessManager, AuthMiddleware(accessManager))
+	s.ampModule = ampmodule.New(
+		ampmodule.WithAccessManager(accessManager),
+		ampmodule.WithAuthMiddleware(AuthMiddleware(accessManager)),
+		ampmodule.WithProviderMiddleware(s.customerPolicyMiddleware("amp-provider")),
+	)
 	ctx := modules.Context{
 		Engine:         engine,
 		BaseHandler:    s.handlers,
@@ -343,7 +365,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || path == "/management.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || path == "/management.html" || strings.HasPrefix(path, "/management/") {
 				c.Next()
 				return
 			}
@@ -355,6 +377,13 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func (s *Server) customerPolicyMiddleware(source string) gin.HandlerFunc {
+	if s == nil || s.customerPolicy == nil {
+		return func(c *gin.Context) { c.Next() }
+	}
+	return s.customerPolicy.Middleware(source)
 }
 
 // setupRoutes configures the API routes for the server.
@@ -371,7 +400,8 @@ func (s *Server) setupRoutes() {
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)
 
-	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/management.html", s.managementAvailabilityMiddleware(), s.serveManagementControlPanel)
+	s.engine.GET("/management/customer-keys.html", s.managementAvailabilityMiddleware(), s.serveCustomerKeysControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -380,7 +410,7 @@ func (s *Server) setupRoutes() {
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
-	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(AuthMiddleware(s.accessManager), s.customerPolicyMiddleware("http"))
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -396,7 +426,7 @@ func (s *Server) setupRoutes() {
 
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
 	codexDirect := s.engine.Group("/backend-api/codex")
-	codexDirect.Use(AuthMiddleware(s.accessManager))
+	codexDirect.Use(AuthMiddleware(s.accessManager), s.customerPolicyMiddleware("http"))
 	{
 		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
@@ -405,23 +435,16 @@ func (s *Server) setupRoutes() {
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
-	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(AuthMiddleware(s.accessManager), s.customerPolicyMiddleware("http"))
 	{
 		v1beta.GET("/models", s.geminiModelsHandler(geminiHandlers))
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
 		v1beta.GET("/models/*action", s.geminiGetHandler(geminiHandlers))
 	}
 
-	// Root endpoint
+	// Keep the default landing path quiet; health checks should use /healthz.
 	s.engine.GET("/", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "CLI Proxy API Server",
-			"endpoints": []string{
-				"POST /v1/chat/completions",
-				"POST /v1/completions",
-				"GET /v1/models",
-			},
-		})
+		c.AbortWithStatus(http.StatusNotFound)
 	})
 	s.engine.POST("/v1internal:method", geminiCLIHandlers.CLIHandler)
 
@@ -583,6 +606,15 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
 		mgmt.GET("/api-key-usage", s.mgmt.GetAPIKeyUsage)
 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
+		mgmt.GET("/customer-keys.html", s.mgmt.ServeCustomerKeysPage)
+		mgmt.GET("/customer-key-policies", s.mgmt.GetCustomerKeyPolicies)
+		mgmt.PUT("/customer-key-policies", s.mgmt.PutCustomerKeyPolicies)
+		mgmt.PATCH("/customer-key-policies/:key_id", s.mgmt.PatchCustomerKeyPolicy)
+		mgmt.DELETE("/customer-key-policies/:key_id", s.mgmt.DeleteCustomerKeyPolicy)
+		mgmt.GET("/customer-key-policies/:key_id/status", s.mgmt.GetCustomerKeyPolicyStatus)
+		mgmt.GET("/customer-key-policies/:key_id/records", s.mgmt.GetCustomerKeyPolicyRecords)
+		mgmt.GET("/customer-key-prices", s.mgmt.GetCustomerKeyPrices)
+		mgmt.POST("/customer-key-prices/sync", s.mgmt.SyncCustomerKeyPrices)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)
@@ -735,7 +767,18 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
+	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
 	c.File(filePath)
+}
+
+func (s *Server) serveCustomerKeysControlPanel(c *gin.Context) {
+	if s == nil || s.cfg == nil || s.cfg.Home.Enabled || s.mgmt == nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	s.mgmt.ServeCustomerKeysPage(c)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
@@ -1388,6 +1431,11 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	s.applyAccessConfig(oldCfg, cfg)
 	s.cfg = cfg
+	if s.customerPolicy != nil {
+		if err := s.customerPolicy.Reload(cfg.CustomerKeyPolicy, cfg.APIKeys, s.configFilePath); err != nil {
+			log.WithError(err).Warn("failed to reload customer policy manager")
+		}
+	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != cfg.WebsocketAuth {
 		s.wsAuthChanged(oldCfg.WebsocketAuth, cfg.WebsocketAuth)
@@ -1401,6 +1449,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if s.mgmt != nil {
 		s.mgmt.SetConfig(cfg)
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
+		s.mgmt.SetCustomerPolicyManager(s.customerPolicy)
 	}
 
 	// Notify Amp module only when Amp config has changed.

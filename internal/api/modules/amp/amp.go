@@ -25,14 +25,15 @@ type Option func(*AmpModule)
 //   - Automatic gzip decompression for misconfigured upstreams
 //   - Model mapping for routing unavailable models to alternatives
 type AmpModule struct {
-	secretSource    SecretSource
-	proxy           *httputil.ReverseProxy
-	proxyMu         sync.RWMutex // protects proxy for hot-reload
-	accessManager   *sdkaccess.Manager
-	authMiddleware_ gin.HandlerFunc
-	modelMapper     *DefaultModelMapper
-	enabled         bool
-	registerOnce    sync.Once
+	secretSource       SecretSource
+	proxy              *httputil.ReverseProxy
+	proxyMu            sync.RWMutex // protects proxy for hot-reload
+	accessManager      *sdkaccess.Manager
+	authMiddleware_    gin.HandlerFunc
+	providerMiddleware []gin.HandlerFunc
+	modelMapper        *DefaultModelMapper
+	enabled            bool
+	registerOnce       sync.Once
 
 	// restrictToLocalhost controls localhost-only access for management routes (hot-reloadable)
 	restrictToLocalhost bool
@@ -41,6 +42,13 @@ type AmpModule struct {
 	// configMu protects lastConfig for partial reload comparison
 	configMu   sync.RWMutex
 	lastConfig *config.AmpCode
+}
+
+// WithProviderMiddleware applies middleware only to provider alias routes.
+func WithProviderMiddleware(middleware ...gin.HandlerFunc) Option {
+	return func(m *AmpModule) {
+		m.providerMiddleware = append(m.providerMiddleware, middleware...)
+	}
 }
 
 // New creates a new Amp routing module with the given options.

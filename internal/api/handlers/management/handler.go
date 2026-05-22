@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/customerpolicy"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"golang.org/x/crypto/bcrypt"
@@ -46,6 +47,7 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	customerPolicy      *customerpolicy.Manager
 }
 
 // NewHandler creates a new management handler instance.
@@ -140,6 +142,16 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetCustomerPolicyManager attaches the customer API key policy manager.
+func (h *Handler) SetCustomerPolicyManager(manager *customerpolicy.Manager) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.customerPolicy = manager
+	h.mu.Unlock()
 }
 
 // Middleware enforces access control for management endpoints.

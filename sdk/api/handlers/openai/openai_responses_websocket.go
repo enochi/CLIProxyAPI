@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/customerpolicy"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -226,6 +227,33 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 
 		modelName := gjson.GetBytes(requestJSON, "model").String()
+		policyReservation, policyDecision := customerpolicy.BeginWebsocketMessage(c, modelName)
+		if policyDecision != nil {
+			errMsg := &interfaces.ErrorMessage{
+				StatusCode: policyDecision.StatusCode,
+				Error:      fmt.Errorf("%s", policyDecision.Message),
+			}
+			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+			markAPIResponseTimestamp(c)
+			errorPayload, errWrite := writeResponsesWebsocketError(conn, &wsTimelineLog, errMsg)
+			log.Infof(
+				"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+				passthroughSessionID,
+				websocket.TextMessage,
+				websocketPayloadEventType(errorPayload),
+				websocketPayloadPreview(errorPayload),
+			)
+			if errWrite != nil {
+				log.Warnf(
+					"responses websocket: downstream_out write failed id=%s event=%s error=%v",
+					passthroughSessionID,
+					websocketPayloadEventType(errorPayload),
+					errWrite,
+				)
+				return
+			}
+			continue
+		}
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
@@ -249,6 +277,19 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
 		completedOutput, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsTimelineLog, passthroughSessionID)
+		policyStatus := http.StatusOK
+		policyFailed := false
+		if forwardErrMsg != nil {
+			policyFailed = true
+			if forwardErrMsg.StatusCode > 0 {
+				policyStatus = forwardErrMsg.StatusCode
+			}
+		}
+		if errForward != nil {
+			policyFailed = true
+			policyStatus = http.StatusInternalServerError
+		}
+		customerpolicy.FinishWebsocketMessage(c, policyReservation, policyStatus, policyFailed)
 		if errForward != nil {
 			wsTerminateErr = errForward
 			log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
